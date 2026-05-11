@@ -478,9 +478,13 @@ fn fs_main(input: GaussianVertexOutput) -> @location(0) vec4<f32> {
 
     let power = -distance_squared / sigma_squared;
 
-    if (distance_squared > 3.0 * 3.0) {
-        discard;
-    }
+    #ifdef SHAPE_SQUARE
+        // Square: skip circle clip so full quad renders
+    #else
+        if (distance_squared > 3.0 * 3.0) {
+            discard;
+        }
+    #endif
 #endif
 
 #ifdef VISUALIZE_BOUNDING_BOX
@@ -494,7 +498,20 @@ fn fs_main(input: GaussianVertexOutput) -> @location(0) vec4<f32> {
     }
 #endif
 
-    let alpha = min(exp(power) * input.color.a, 0.999);
+#ifdef SHAPE_SQUARE
+    // fuzziness=0 → hard square (alpha=1 everywhere in quad)
+    // fuzziness=1 → soft square (fades: edge=0 alpha, center=1 alpha)
+    let edge_dist = min(1.0 - abs(input.uv.x), 1.0 - abs(input.uv.y));
+    let fill = mix(1.0, edge_dist, gaussian_uniforms.fuzziness);
+    let alpha = min(fill * input.color.a, 0.999);
+#else
+    // fuzziness=0 → hard opaque disc (step at r=1 inscribed circle)
+    // fuzziness=1 → original equation: exp(power) * color.a
+    let r_sq = dot(input.uv, input.uv);
+    let hard_disc = select(0.0, 1.0, r_sq < 1.0);  // 1 inside circle, 0 outside
+    let fill = mix(hard_disc, exp(power), gaussian_uniforms.fuzziness);
+    let alpha = min(fill * input.color.a, 0.999);
+#endif
 
     // TODO: round alpha to terminate depth test?
 

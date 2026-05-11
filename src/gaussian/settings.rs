@@ -53,6 +53,15 @@ pub enum GaussianColorSpace {
     LinRec709Display,
 }
 
+#[derive(
+    Clone, Copy, Debug, Default, Eq, Hash, PartialEq, Reflect, Serialize, Deserialize, ValueEnum,
+)]
+pub enum SplatShape {
+    #[default]
+    Circle,
+    Square,
+}
+
 // TODO: breakdown into components
 #[derive(Component, Clone, Debug, Reflect, Serialize, Deserialize)]
 #[reflect(Component)]
@@ -74,6 +83,8 @@ pub struct CloudSettings {
     pub time_scale: f32,
     pub time_start: f32,
     pub time_stop: f32,
+    pub shape: SplatShape,
+    pub edge_fuzziness: f32,
 }
 
 impl Default for CloudSettings {
@@ -95,6 +106,8 @@ impl Default for CloudSettings {
             time_scale: 1.0,
             time_start: 0.0,
             time_stop: 1.0,
+            shape: SplatShape::Circle,
+            edge_fuzziness: 1.0,
         }
     }
 }

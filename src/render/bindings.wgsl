@@ -1,3 +1,5 @@
+// vendor\bevy_gaussian_splatting\src\render\bindings.wgsl
+
 #define_import_path bevy_gaussian_splatting::bindings
 
 #import bevy_pbr::prepass_bindings::PreviousViewUniforms
@@ -23,6 +25,7 @@ struct GaussianUniforms {
     color_space: u32,
     min: vec4<f32>,
     max: vec4<f32>,
+    fuzziness: f32,
 };
 @group(1) @binding(0) var<uniform> gaussian_uniforms: GaussianUniforms;
 

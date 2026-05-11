@@ -45,7 +45,7 @@ use crate::{
     gaussian::{
         cloud::CloudVisibilityClass,
         interface::CommonCloud,
-        settings::{CloudSettings, DrawMode, GaussianColorSpace, GaussianMode, RasterizeMode},
+        settings::{CloudSettings, DrawMode, GaussianColorSpace, GaussianMode, RasterizeMode, SplatShape},
     },
     material::{
         spherical_harmonics::{HALF_SH_COEFF_COUNT, SH_COEFF_COUNT, SH_DEGREE, SH_VEC4_PLANES},
@@ -414,6 +414,7 @@ fn queue_gaussians<R: PlanarSync>(
                 rasterize_mode: settings.rasterize_mode,
                 sample_count: msaa.samples(),
                 hdr: view.hdr,
+                shape: settings.shape,
             };
 
             let pipeline = pipelines.specialize(&pipeline_cache, &custom_pipeline, key);
@@ -795,6 +796,11 @@ pub fn shader_defs(key: CloudPipelineKey) -> Vec<ShaderDefVal> {
         shader_defs.push("VISUALIZE_BOUNDING_BOX".into());
     }
 
+    match key.shape {  
+        SplatShape::Square      => shader_defs.push("SHAPE_SQUARE".into()),
+        SplatShape::Circle      => {}  // default, fuzziness handled via uniform
+    }
+
     #[cfg(feature = "morph_particles")]
     shader_defs.push("READ_WRITE_POINTS".into());
 
@@ -876,6 +882,7 @@ pub struct CloudPipelineKey {
     pub rasterize_mode: RasterizeMode,
     pub sample_count: u32,
     pub hdr: bool,
+    pub shape: SplatShape,
 }
 
 impl<R: PlanarSync> SpecializedRenderPipeline for CloudPipeline<R> {
@@ -976,6 +983,7 @@ pub struct CloudUniform {
     pub color_space: u32,
     pub min: Vec4,
     pub max: Vec4,
+    pub fuzziness: f32,
 }
 
 #[allow(clippy::type_complexity)]
@@ -1039,6 +1047,7 @@ pub fn extract_gaussians<R: PlanarSync>(
             },
             min: aabb.min().extend(1.0),
             max: aabb.max().extend(1.0),
+            fuzziness: settings.edge_fuzziness.max(0.01),
         };
 
         commands_list.push((
