@@ -1,3 +1,5 @@
+// vendor\bevy_gaussian_splatting\src\render\gaussian.wgsl
+
 #import bevy_gaussian_splatting::bindings::{
     view,
     gaussian_uniforms,
@@ -499,11 +501,9 @@ fn fs_main(input: GaussianVertexOutput) -> @location(0) vec4<f32> {
 #endif
 
 #ifdef SHAPE_SQUARE
-    // fuzziness=0 → hard square (alpha=1 everywhere in quad)
-    // fuzziness=1 → soft square (fades: edge=0 alpha, center=1 alpha)
     let edge_dist = min(1.0 - abs(input.uv.x), 1.0 - abs(input.uv.y));
-    let fill = mix(1.0, edge_dist, gaussian_uniforms.fuzziness);
-    let alpha = min(fill * input.color.a, 0.999);
+    let fill = mix(1.0, saturate(edge_dist), gaussian_uniforms.fuzziness);
+    let alpha = mix(min(input.color.a, 0.999), fill * input.color.a, gaussian_uniforms.fuzziness);
 #else
     // fuzziness=0 → hard opaque disc (step at r=1 inscribed circle)
     // fuzziness=1 → original equation: exp(power) * color.a

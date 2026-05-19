@@ -1,3 +1,5 @@
+// vendor\bevy_gaussian_splatting\src\render\gaussian_2d.wgsl
+
 #define_import_path bevy_gaussian_splatting::gaussian_2d
 
 #ifdef GAUSSIAN_2D

@@ -1,3 +1,5 @@
+// vendor\bevy_gaussian_splatting\src\gaussian\settings.rs
+
 use bevy::prelude::*;
 use bevy_args::{Deserialize, Serialize, ValueEnum};
 
