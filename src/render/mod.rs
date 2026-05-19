@@ -45,7 +45,9 @@ use crate::{
     gaussian::{
         cloud::CloudVisibilityClass,
         interface::CommonCloud,
-        settings::{CloudSettings, DrawMode, GaussianColorSpace, GaussianMode, RasterizeMode, SplatShape},
+        settings::{
+            CloudSettings, DrawMode, GaussianColorSpace, GaussianMode, RasterizeMode, SplatShape,
+        },
     },
     material::{
         spherical_harmonics::{HALF_SH_COEFF_COUNT, SH_COEFF_COUNT, SH_DEGREE, SH_VEC4_PLANES},
@@ -796,9 +798,9 @@ pub fn shader_defs(key: CloudPipelineKey) -> Vec<ShaderDefVal> {
         shader_defs.push("VISUALIZE_BOUNDING_BOX".into());
     }
 
-    match key.shape {  
-        SplatShape::Square      => shader_defs.push("SHAPE_SQUARE".into()),
-        SplatShape::Circle      => {}  // default, fuzziness handled via uniform
+    match key.shape {
+        SplatShape::Square => shader_defs.push("SHAPE_SQUARE".into()),
+        SplatShape::Circle => {} // default, fuzziness handled via uniform
     }
 
     #[cfg(feature = "morph_particles")]

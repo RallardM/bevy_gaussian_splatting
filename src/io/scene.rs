@@ -2103,9 +2103,11 @@ mod tests {
             result.len(),
             (supported_degree + 1) * (supported_degree + 1)
         );
-        assert!(result
-            .iter()
-            .all(|(index, _)| *index < (supported_degree + 1) * (supported_degree + 1)));
+        assert!(
+            result
+                .iter()
+                .all(|(index, _)| *index < (supported_degree + 1) * (supported_degree + 1))
+        );
     }
 
     #[test]
@@ -2281,8 +2283,7 @@ mod tests {
         });
 
         let bytes = serde_json::to_vec(&root).expect("failed to serialize glTF");
-        let gltf = gltf::Gltf::from_slice_without_validation(&bytes)
-            .expect("failed to parse glTF");
+        let gltf = gltf::Gltf::from_slice_without_validation(&bytes).expect("failed to parse glTF");
 
         assert!(gltf.blob.is_none());
         gltf
