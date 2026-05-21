@@ -1,3 +1,5 @@
+// vendor\bevy_gaussian_splatting\src\render\mod.rs
+
 #![allow(dead_code)] // ShaderType derives emit unused check helpers
 use std::{borrow::Cow, hash::Hash, num::NonZero};
 
@@ -80,6 +82,8 @@ const PLANAR_SHADER_HANDLE: Handle<Shader> = uuid_handle!("d6a3f978-f795-4786-84
 const TEXTURE_SHADER_HANDLE: Handle<Shader> = uuid_handle!("500e2ebf-51a8-402e-9c88-e0d5152c3486");
 const TRANSFORM_SHADER_HANDLE: Handle<Shader> =
     uuid_handle!("648516b2-87cc-4937-ae1c-d986952e9fa7");
+const GAUSSIAN_HYBRID_SHADER_HANDLE: Handle<Shader> =
+    uuid_handle!("f3a2b1c0-d4e5-6789-abcd-ef0123456789");
 
 // TODO: consider refactor to bind via bevy's mesh (dynamic vertex planes) + shared batching/instancing/preprocessing
 //       utilize RawBufferVec<T> for gaussian data?
@@ -199,6 +203,13 @@ where
             app,
             TRANSFORM_SHADER_HANDLE,
             "transform.wgsl",
+            Shader::from_wgsl
+        );
+
+        load_internal_asset!(
+            app,
+            GAUSSIAN_HYBRID_SHADER_HANDLE,
+            "gaussian_hybrid.wgsl",
             Shader::from_wgsl
         );
 
@@ -448,6 +459,7 @@ fn queue_gaussians<R: PlanarSync>(
 #[derive(Resource)]
 pub struct CloudPipeline<R: PlanarSync> {
     shader: Handle<Shader>,
+    hybrid_shader: Handle<Shader>,
     pub gaussian_cloud_layout: BindGroupLayout,
     pub gaussian_cloud_layout_desc: BindGroupLayoutDescriptor,
     pub gaussian_uniform_layout: BindGroupLayout,
@@ -677,6 +689,7 @@ where
             compute_view_layout,
             compute_view_layout_desc,
             shader: GAUSSIAN_SHADER_HANDLE,
+            hybrid_shader: GAUSSIAN_HYBRID_SHADER_HANDLE,
             sorted_layout,
             sorted_layout_desc,
             phantom: std::marker::PhantomData,
@@ -798,9 +811,13 @@ pub fn shader_defs(key: CloudPipelineKey) -> Vec<ShaderDefVal> {
         shader_defs.push("VISUALIZE_BOUNDING_BOX".into());
     }
 
-    match key.shape {
-        SplatShape::Square => shader_defs.push("SHAPE_SQUARE".into()),
-        SplatShape::Circle => {} // default, fuzziness handled via uniform
+    // SHAPE_SQUARE is a global override for non-hybrid modes only.
+    // In hybrid mode shape is encoded per-splat in the visibility channel.
+    if key.gaussian_mode != GaussianMode::GaussianHybrid {
+        match key.shape {
+            SplatShape::Square => shader_defs.push("SHAPE_SQUARE".into()),
+            SplatShape::Circle => {}
+        }
     }
 
     #[cfg(feature = "morph_particles")]
@@ -845,10 +862,13 @@ pub fn shader_defs(key: CloudPipelineKey) -> Vec<ShaderDefVal> {
         GaussianMode::Gaussian2d => shader_defs.push("GAUSSIAN_2D".into()),
         GaussianMode::Gaussian3d => shader_defs.push("GAUSSIAN_3D".into()),
         GaussianMode::Gaussian4d => shader_defs.push("GAUSSIAN_4D".into()),
+        GaussianMode::GaussianHybrid => shader_defs.push("GAUSSIAN_HYBRID".into()),
     }
 
     match key.gaussian_mode {
-        GaussianMode::Gaussian2d | GaussianMode::Gaussian3d => {
+        GaussianMode::Gaussian2d
+        | GaussianMode::Gaussian3d
+        | GaussianMode::GaussianHybrid => {
             shader_defs.push("GAUSSIAN_3D_STRUCTURE".into());
         }
         _ => {}
@@ -901,6 +921,12 @@ impl<R: PlanarSync> SpecializedRenderPipeline for CloudPipeline<R> {
 
         debug!("specializing cloud pipeline");
 
+        let active_shader = if key.gaussian_mode == GaussianMode::GaussianHybrid {
+            self.hybrid_shader.clone()
+        } else {
+            self.shader.clone()
+        };
+
         RenderPipelineDescriptor {
             label: Some("gaussian cloud render pipeline".into()),
             layout: vec![
@@ -910,13 +936,13 @@ impl<R: PlanarSync> SpecializedRenderPipeline for CloudPipeline<R> {
                 self.sorted_layout_desc.clone(),
             ],
             vertex: VertexState {
-                shader: self.shader.clone(),
+                shader: active_shader.clone(),
                 shader_defs: shader_defs.clone(),
                 entry_point: Some("vs_points".into()),
                 buffers: vec![],
             },
             fragment: Some(FragmentState {
-                shader: self.shader.clone(),
+                shader: active_shader,
                 shader_defs,
                 entry_point: Some("fs_main".into()),
                 targets: vec![Some(ColorTargetState {

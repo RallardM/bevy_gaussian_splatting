@@ -21,6 +21,7 @@ pub enum GaussianMode {
     #[default]
     Gaussian3d,
     Gaussian4d,
+    GaussianHybrid,
 }
 
 #[derive(

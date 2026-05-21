@@ -136,15 +136,12 @@
         @location(4) local_to_pixel_w: vec3<f32>,
         @location(5) mean_2d: vec2<f32>,
         @location(6) radius: vec2<f32>,
-        @location(7) per_splat_fuzziness: f32,
     #else #ifdef GAUSSIAN_3D
         @location(2) conic: vec3<f32>,
         @location(3) major_minor: vec2<f32>,
-        @location(4) per_splat_fuzziness: f32,
     #else #ifdef GAUSSIAN_4D
         @location(2) conic: vec3<f32>,
         @location(3) major_minor: vec2<f32>,
-        @location(4) per_splat_fuzziness: f32,
     #endif
     };
 #else
@@ -158,15 +155,12 @@
         @location(4) @interpolate(flat) local_to_pixel_w: vec3<f32>,
         @location(5) @interpolate(flat) mean_2d: vec2<f32>,
         @location(6) @interpolate(flat) radius: vec2<f32>,
-        @location(7) @interpolate(flat) per_splat_fuzziness: f32,
     #else ifdef GAUSSIAN_3D
         @location(2) @interpolate(flat) conic: vec3<f32>,
         @location(3) @interpolate(linear) major_minor: vec2<f32>,
-        @location(4) @interpolate(flat) per_splat_fuzziness: f32,
     #else ifdef GAUSSIAN_4D
         @location(2) @interpolate(flat) conic: vec3<f32>,
         @location(3) @interpolate(linear) major_minor: vec2<f32>,
-        @location(4) @interpolate(flat) per_splat_fuzziness: f32,
     #endif
     };
 #endif
@@ -439,7 +433,6 @@ fn vs_points(
         projected_position.xy + bb.xy,
         projected_position.zw,
     );
-    output.per_splat_fuzziness = get_visibility(splat_index);
 
     return output;
 }
@@ -480,14 +473,6 @@ fn fs_main(input: GaussianVertexOutput) -> @location(0) vec4<f32> {
     }
 #endif
 
-// Decode per-splat shape + fuzziness from the visibility channel (encoded in build_planar).
-    // [0, 1) = circle, value is fuzziness.
-    // [2, 3) = square, value - 2 is fuzziness.
-    // When SHAPE_SQUARE is defined globally this is bypassed and the global uniform applies.
-    let _enc = input.per_splat_fuzziness;
-    let _splat_square = _enc >= 2.0;
-    let _splat_fuzz = _enc - select(0.0, 2.0, _splat_square);
-
 #ifdef USE_OBB
     let sigma = 1.0 / 3.0;
     let sigma_squared = 2.0 * sigma * sigma;
@@ -495,13 +480,9 @@ fn fs_main(input: GaussianVertexOutput) -> @location(0) vec4<f32> {
 
     let power = -distance_squared / sigma_squared;
 
-    #ifdef SHAPE_SQUARE
-        // Global square: skip circle clip
-    #else
-        if (!_splat_square && distance_squared > 3.0 * 3.0) {
-            discard;
-        }
-    #endif
+    if (distance_squared > 3.0 * 3.0) {
+        discard;
+    }
 #endif
 
 #ifdef VISUALIZE_BOUNDING_BOX
@@ -515,25 +496,9 @@ fn fs_main(input: GaussianVertexOutput) -> @location(0) vec4<f32> {
     }
 #endif
 
-#ifdef SHAPE_SQUARE
-    // Global square mode: all splats square, global fuzziness uniform.
-    let edge_dist = min(1.0 - abs(input.uv.x), 1.0 - abs(input.uv.y));
-    let fill = mix(1.0, saturate(edge_dist), gaussian_uniforms.fuzziness);
-    let alpha = mix(input.color.a, fill * input.color.a, gaussian_uniforms.fuzziness);
-#else
-    // Per-splat mode: shape and fuzziness from the decoded visibility channel.
-    var alpha: f32;
-    if _splat_square {
-        let edge_dist = min(1.0 - abs(input.uv.x), 1.0 - abs(input.uv.y));
-        let fill = mix(1.0, saturate(edge_dist), _splat_fuzz);
-        alpha = mix(input.color.a, fill * input.color.a, _splat_fuzz);
-    } else {
-        let r_sq = dot(input.uv, input.uv);
-        let hard_disc = select(0.0, 1.0, r_sq < 1.0);
-        let fill = mix(hard_disc, exp(power), _splat_fuzz);
-        alpha = fill * input.color.a;  // no 0.999 cap — fixes black translucency and black circle soft edge
-    }
-#endif
+    let alpha = min(exp(power) * input.color.a, 0.999);
+
+    // TODO: round alpha to terminate depth test?
 
     return vec4<f32>(
         input.color.rgb * alpha,
