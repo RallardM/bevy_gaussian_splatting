@@ -96,7 +96,7 @@ impl Default for CloudSettings {
             aabb: false,
             global_opacity: 1.0,
             global_scale: 1.0,
-            opacity_adaptive_radius: true,
+            opacity_adaptive_radius: false,
             visualize_bounding_box: false,
             sort_mode: SortMode::default(),
             draw_mode: DrawMode::default(),

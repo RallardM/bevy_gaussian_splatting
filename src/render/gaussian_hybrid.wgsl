@@ -359,7 +359,7 @@ fn vs_points(
 #ifdef OPACITY_ADAPTIVE_RADIUS
     let cutoff = sqrt(max(9.0 + 2.0 * log(opacity), 0.000001));
 #else
-    let cutoff = 3.0;
+    let cutoff = 4.0;
 #endif
 
     var bb: vec4<f32>;
@@ -489,9 +489,11 @@ fn fs_main(input: GaussianVertexOutput) -> @location(0) vec4<f32> {
 #endif
 
 #ifdef USE_OBB
-    let sigma_sq   = 2.0 * (1.0 / 3.0) * (1.0 / 3.0);
-    let dist_sq    = dot(input.uv, input.uv);
-    power = -dist_sq / sigma_sq;
+    let sigma           = 0.2;
+    let scale           = 3.9;  
+    let sigma_squared   = scale * sigma * sigma;
+    let dist_sq         = dot(input.uv, input.uv);
+    power = -dist_sq / sigma_squared ;
     // Circle clip: skip for square splats.
     if !is_square && dist_sq > 9.0 { discard; }
 #endif
