@@ -1,3 +1,5 @@
+// vendor\bevy_gaussian_splatting\tests\headless_examples.rs
+
 #![allow(dead_code, unused_imports)]
 
 use bevy::{
@@ -444,7 +446,7 @@ fn setup_gaussian_cloud(
         ));
     } else {
         match args.gaussian_mode {
-            GaussianMode::Gaussian2d | GaussianMode::Gaussian3d => {
+            GaussianMode::Gaussian2d | GaussianMode::Gaussian3d | GaussianMode::GaussianHybrid => {
                 let cloud = if args.gaussian_count > 0 {
                     if let Some(seed) = args.gaussian_seed {
                         gaussian_assets.add(random_gaussians_3d_seeded(args.gaussian_count, seed))

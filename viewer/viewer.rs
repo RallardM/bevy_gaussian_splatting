@@ -1,3 +1,5 @@
+// vendor\bevy_gaussian_splatting\viewer\viewer.rs
+
 // TODO: move to editor crate
 use std::path::PathBuf;
 
@@ -186,7 +188,7 @@ fn setup_gaussian_cloud(
     }
 
     match args.gaussian_mode {
-        GaussianMode::Gaussian2d | GaussianMode::Gaussian3d => {
+        GaussianMode::Gaussian2d | GaussianMode::Gaussian3d | GaussianMode::GaussianHybrid => {
             let cloud: Handle<PlanarGaussian3d>;
             if args.gaussian_count > 0 {
                 log(&format!("generating {} gaussians", args.gaussian_count));
