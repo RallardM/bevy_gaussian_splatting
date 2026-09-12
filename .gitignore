@@ -24,3 +24,4 @@ www/examples/thumbnails/
 
 # Keep generated GLBs out of git while allowing conformance fixtures.
 !tests/fixtures/**/*.glb
+/.vs
