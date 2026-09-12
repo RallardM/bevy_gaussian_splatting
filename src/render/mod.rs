@@ -9,7 +9,7 @@ use bevy::{
     asset::{AssetEvent, AssetId, load_internal_asset, uuid_handle},
     camera::primitives::Aabb,
     core_pipeline::{
-        core_3d::Transparent3d,
+        core_3d::{Transparent3d, TransparentSortingInfo3d},
         prepass::{
             MotionVectorPrepass, PreviousViewData, PreviousViewUniformOffset, PreviousViewUniforms,
         },
@@ -48,7 +48,9 @@ use crate::{
         cloud::CloudVisibilityClass,
         interface::CommonCloud,
         settings::{
-            CloudSettings, DrawMode, GaussianColorSpace, GaussianMode, RasterizeMode, SplatShape,
+            CloudSettings, DrawMode, GaussianColorSpace, GaussianMode, RadixSortDepthBits,
+            RasterizeMode,
+            SplatShape,
         },
     },
     material::{
@@ -395,7 +397,11 @@ fn queue_gaussians<R: PlanarSync>(
         };
 
         debug!("visible entities...");
-        for (render_entity, visible_entity) in visible_entities.iter::<CloudVisibilityClass>() {
+        let Some(visible_class) = visible_entities.get::<CloudVisibilityClass>() else {
+            continue;
+        };
+
+        for (render_entity, visible_entity) in &visible_class.entities_cpu_culling {
             if gaussian_splatting_bundles.get(*render_entity).is_err() {
                 debug!("gaussian splatting bundle not found");
                 continue;
@@ -426,6 +432,8 @@ fn queue_gaussians<R: PlanarSync>(
                 gaussian_mode: settings.gaussian_mode,
                 rasterize_mode: settings.rasterize_mode,
                 sample_count: msaa.samples(),
+                hdr: view.target_format == TextureFormat::Rgba16Float,
+                additive: settings.additive,
                 hdr: view.hdr,
                 shape: settings.shape,
             };
@@ -441,7 +449,11 @@ fn queue_gaussians<R: PlanarSync>(
                 );
             let distance = rangefinder.distance(&center.translation());
 
-            transparent_phase.add(Transparent3d {
+            transparent_phase.add_transient(Transparent3d {
+                sorting_info: TransparentSortingInfo3d::Sorted {
+                    mesh_center: center.translation(),
+                    depth_bias: 0.0,
+                },
                 entity: (*render_entity, *visible_entity),
                 draw_function: draw_custom,
                 distance,
@@ -699,9 +711,11 @@ where
 
 // TODO: allow setting shader defines via API
 // TODO: separate shader defines for each pipeline
+#[derive(Clone, Copy, Debug)]
 pub struct ShaderDefines {
     pub radix_bits_per_digit: u32,
     pub radix_digit_places: u32,
+    pub radix_key_shift: u32,
     pub radix_base: u32,
     pub entries_per_invocation_a: u32,
     pub entries_per_invocation_c: u32,
@@ -715,19 +729,10 @@ pub struct ShaderDefines {
 }
 
 impl ShaderDefines {
-    pub fn max_tile_count(&self, count: usize) -> u32 {
-        (count as u32).div_ceil(self.workgroup_entries_c)
-    }
-
-    pub fn sorting_status_counters_buffer_size(&self, count: usize) -> usize {
-        self.radix_base as usize * self.max_tile_count(count) as usize * std::mem::size_of::<u32>()
-    }
-}
-
-impl Default for ShaderDefines {
-    fn default() -> Self {
+    pub fn for_radix_depth_bits(radix_sort_depth_bits: RadixSortDepthBits) -> Self {
         let radix_bits_per_digit = 8;
-        let radix_digit_places = 32 / radix_bits_per_digit;
+        let radix_digit_places = radix_sort_depth_bits.bits() / radix_bits_per_digit;
+        let radix_key_shift = 32 - radix_sort_depth_bits.bits();
         let radix_base = 1 << radix_bits_per_digit;
         let entries_per_invocation_a = 4;
         let entries_per_invocation_c = 4;
@@ -742,6 +747,7 @@ impl Default for ShaderDefines {
         Self {
             radix_bits_per_digit,
             radix_digit_places,
+            radix_key_shift,
             radix_base,
             entries_per_invocation_a,
             entries_per_invocation_c,
@@ -754,10 +760,34 @@ impl Default for ShaderDefines {
             temporal_sort_window_size: 16,
         }
     }
+
+    pub fn max_tile_count(&self, count: usize) -> u32 {
+        (count as u32).div_ceil(self.workgroup_entries_c)
+    }
+
+    pub fn sorting_status_counters_buffer_size(&self, count: usize) -> usize {
+        self.radix_base as usize * self.max_tile_count(count) as usize * std::mem::size_of::<u32>()
+    }
+
+    pub fn radix_initial_parity(&self) -> usize {
+        (self.radix_digit_places % 2) as usize
+    }
+}
+
+impl Default for ShaderDefines {
+    fn default() -> Self {
+        Self::for_radix_depth_bits(RadixSortDepthBits::default())
+    }
 }
 
 pub fn shader_defs(key: CloudPipelineKey) -> Vec<ShaderDefVal> {
-    let defines = ShaderDefines::default();
+    shader_defs_with_defines(key, ShaderDefines::default())
+}
+
+pub fn shader_defs_with_defines(
+    key: CloudPipelineKey,
+    defines: ShaderDefines,
+) -> Vec<ShaderDefVal> {
     let mut shader_defs = vec![
         ShaderDefVal::UInt("SH_COEFF_COUNT".into(), SH_COEFF_COUNT as u32),
         ShaderDefVal::UInt("SH_4D_COEFF_COUNT".into(), SH_4D_COEFF_COUNT as u32),
@@ -768,6 +798,7 @@ pub fn shader_defs(key: CloudPipelineKey) -> Vec<ShaderDefVal> {
         ShaderDefVal::UInt("RADIX_BASE".into(), defines.radix_base),
         ShaderDefVal::UInt("RADIX_BITS_PER_DIGIT".into(), defines.radix_bits_per_digit),
         ShaderDefVal::UInt("RADIX_DIGIT_PLACES".into(), defines.radix_digit_places),
+        ShaderDefVal::UInt("RADIX_KEY_SHIFT".into(), defines.radix_key_shift),
         ShaderDefVal::UInt(
             "ENTRIES_PER_INVOCATION_A".into(),
             defines.entries_per_invocation_a,
@@ -904,6 +935,9 @@ pub struct CloudPipelineKey {
     pub rasterize_mode: RasterizeMode,
     pub sample_count: u32,
     pub hdr: bool,
+    /// See [`CloudSettings::additive`]. Blending is fixed-function pipeline state rather than
+    /// something the shader can select, so the two modes specialize to distinct pipelines.
+    pub additive: bool,
     pub shape: SplatShape,
 }
 
@@ -935,6 +969,7 @@ impl<R: PlanarSync> SpecializedRenderPipeline for CloudPipeline<R> {
                 self.gaussian_cloud_layout_desc.clone(),
                 self.sorted_layout_desc.clone(),
             ],
+            immediate_size: 0,
             vertex: VertexState {
                 shader: active_shader.clone(),
                 shader_defs: shader_defs.clone(),
@@ -947,7 +982,22 @@ impl<R: PlanarSync> SpecializedRenderPipeline for CloudPipeline<R> {
                 entry_point: Some("fs_main".into()),
                 targets: vec![Some(ColorTargetState {
                     format,
-                    blend: Some(BlendState::PREMULTIPLIED_ALPHA_BLENDING),
+                    blend: Some(if key.additive {
+                        BlendState {
+                            color: BlendComponent {
+                                src_factor: BlendFactor::One,
+                                dst_factor: BlendFactor::One,
+                                operation: BlendOperation::Add,
+                            },
+                            alpha: BlendComponent {
+                                src_factor: BlendFactor::One,
+                                dst_factor: BlendFactor::One,
+                                operation: BlendOperation::Add,
+                            },
+                        }
+                    } else {
+                        BlendState::PREMULTIPLIED_ALPHA_BLENDING
+                    }),
                     write_mask: ColorWrites::ALL,
                 })],
             }),
@@ -962,8 +1012,8 @@ impl<R: PlanarSync> SpecializedRenderPipeline for CloudPipeline<R> {
             },
             depth_stencil: Some(DepthStencilState {
                 format: TextureFormat::Depth32Float,
-                depth_write_enabled: false,
-                depth_compare: CompareFunction::GreaterEqual,
+                depth_write_enabled: Some(false),
+                depth_compare: Some(CompareFunction::GreaterEqual),
                 stencil: StencilState {
                     front: StencilFaceState::IGNORE,
                     back: StencilFaceState::IGNORE,
@@ -981,7 +1031,6 @@ impl<R: PlanarSync> SpecializedRenderPipeline for CloudPipeline<R> {
                 mask: !0,
                 alpha_to_coverage_enabled: false,
             },
-            push_constant_ranges: Vec::new(),
             zero_initialize_workgroup_memory: true,
         }
     }

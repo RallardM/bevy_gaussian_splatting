@@ -23,9 +23,6 @@ use bevy::asset::{
 #[cfg(feature = "web_asset")]
 use bevy::asset::io::web::WebAssetPlugin;
 use bevy_args::{BevyArgsPlugin, parse_args};
-use bevy_inspector_egui::{
-    DefaultInspectorConfigPlugin, bevy_egui::EguiPlugin, quick::WorldInspectorPlugin,
-};
 use bevy_panorbit_camera::{PanOrbitCamera, PanOrbitCameraPlugin};
 
 #[cfg(feature = "web_asset")]
@@ -217,6 +214,7 @@ fn setup_gaussian_cloud(
                             gaussian_mode: args.gaussian_mode,
                             playback_mode: args.playback_mode,
                             rasterize_mode: args.rasterization_mode,
+                            radix_sort_depth_bits: args.radix_sort_depth_bits,
                             ..default()
                         },
                         GaussianInterpolate::<Gaussian3d> {
@@ -233,6 +231,7 @@ fn setup_gaussian_cloud(
                             gaussian_mode: args.gaussian_mode,
                             playback_mode: args.playback_mode,
                             rasterize_mode: args.rasterization_mode,
+                            radix_sort_depth_bits: args.radix_sort_depth_bits,
                             ..default()
                         },
                         PlanarGaussian3dHandle(cloud.clone()),
@@ -250,6 +249,7 @@ fn setup_gaussian_cloud(
                         gaussian_mode: args.gaussian_mode,
                         playback_mode: args.playback_mode,
                         rasterize_mode: args.rasterization_mode,
+                        radix_sort_depth_bits: args.radix_sort_depth_bits,
                         ..default()
                     },
                     PlanarGaussian3dHandle(cloud.clone()),
@@ -282,6 +282,7 @@ fn setup_gaussian_cloud(
                     gaussian_mode: args.gaussian_mode,
                     playback_mode: args.playback_mode,
                     rasterize_mode: args.rasterization_mode,
+                    radix_sort_depth_bits: args.radix_sort_depth_bits,
                     ..default()
                 },
                 Name::new("gaussian_cloud_4d"),
@@ -377,6 +378,7 @@ fn apply_scene_render_mode_override(
             let child: Entity = child;
             if let Ok(mut settings) = cloud_settings.get_mut(child) {
                 settings.rasterize_mode = args.rasterization_mode;
+                settings.radix_sort_depth_bits = args.radix_sort_depth_bits;
             }
         }
 
@@ -547,12 +549,6 @@ fn viewer_app() {
     app.add_plugins(default_plugins);
     app.add_plugins(BevyArgsPlugin::<GaussianSplattingViewer>::default());
     app.add_plugins(PanOrbitCameraPlugin);
-
-    if config.editor {
-        app.add_plugins(EguiPlugin::default());
-        app.add_plugins(DefaultInspectorConfigPlugin);
-        app.add_plugins(WorldInspectorPlugin::new());
-    }
 
     if config.press_esc_close {
         app.add_systems(Update, press_esc_close);
@@ -732,8 +728,8 @@ fn fps_display_setup(mut commands: Commands, asset_server: Res<AssetServer>) {
         .spawn((
             Text("fps: ".to_string()),
             TextFont {
-                font: asset_server.load("fonts/Caveat-Bold.ttf"),
-                font_size: 60.0,
+                font: FontSource::Handle(asset_server.load("fonts/Caveat-Bold.ttf")),
+                font_size: FontSize::Px(60.0),
                 ..Default::default()
             },
             TextColor(Color::WHITE),
@@ -749,8 +745,8 @@ fn fps_display_setup(mut commands: Commands, asset_server: Res<AssetServer>) {
             FpsText,
             TextColor(Color::Srgba(GOLD)),
             TextFont {
-                font: asset_server.load("fonts/Caveat-Bold.ttf"),
-                font_size: 60.0,
+                font: FontSource::Handle(asset_server.load("fonts/Caveat-Bold.ttf")),
+                font_size: FontSize::Px(60.0),
                 ..Default::default()
             },
             TextSpan::default(),
@@ -760,16 +756,42 @@ fn fps_display_setup(mut commands: Commands, asset_server: Res<AssetServer>) {
 #[derive(Component)]
 struct FpsText;
 
+#[derive(Default)]
+struct FpsDisplayState {
+    smoothed_fps: Option<f64>,
+    update_elapsed_secs: f32,
+}
+
 fn fps_update_system(
     diagnostics: Res<DiagnosticsStore>,
+    time: Res<Time>,
+    mut state: Local<FpsDisplayState>,
     mut query: Query<&mut TextSpan, With<FpsText>>,
 ) {
+    let Some(fps) = diagnostics.get(&FrameTimeDiagnosticsPlugin::FPS) else {
+        return;
+    };
+    let Some(value) = fps.smoothed() else {
+        return;
+    };
+
+    const SMOOTHING_ALPHA: f64 = 0.08;
+    const DISPLAY_UPDATE_INTERVAL_SECS: f32 = 0.5;
+
+    let smoothed_fps = state.smoothed_fps.map_or(value, |current| {
+        current + (value - current) * SMOOTHING_ALPHA
+    });
+    state.smoothed_fps = Some(smoothed_fps);
+
+    state.update_elapsed_secs += time.delta_secs();
+    if state.update_elapsed_secs < DISPLAY_UPDATE_INTERVAL_SECS {
+        return;
+    }
+    state.update_elapsed_secs = 0.0;
+
+    let display_fps = smoothed_fps.round() as u32;
     for mut text in &mut query {
-        if let Some(fps) = diagnostics.get(&FrameTimeDiagnosticsPlugin::FPS)
-            && let Some(value) = fps.smoothed()
-        {
-            **text = format!("{value:.2}");
-        }
+        **text = display_fps.to_string();
     }
 }
 

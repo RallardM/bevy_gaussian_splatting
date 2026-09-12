@@ -49,6 +49,36 @@ pub enum RasterizeMode {
     Velocity,
 }
 
+#[derive(
+    Clone, Copy, Debug, Default, Eq, Hash, PartialEq, Reflect, Serialize, Deserialize, ValueEnum,
+)]
+pub enum RadixSortDepthBits {
+    Bits16,
+    Bits24,
+    #[default]
+    Bits32,
+}
+
+impl RadixSortDepthBits {
+    pub const VARIANTS: [Self; 3] = [Self::Bits16, Self::Bits24, Self::Bits32];
+
+    pub const fn bits(self) -> u32 {
+        match self {
+            Self::Bits16 => 16,
+            Self::Bits24 => 24,
+            Self::Bits32 => 32,
+        }
+    }
+
+    pub const fn pipeline_index(self) -> usize {
+        match self {
+            Self::Bits16 => 0,
+            Self::Bits24 => 1,
+            Self::Bits32 => 2,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq, Reflect, Serialize, Deserialize)]
 pub enum GaussianColorSpace {
     #[default]
@@ -76,6 +106,7 @@ pub struct CloudSettings {
     pub opacity_adaptive_radius: bool,
     pub visualize_bounding_box: bool,
     pub sort_mode: SortMode,
+    pub radix_sort_depth_bits: RadixSortDepthBits,
     pub draw_mode: DrawMode,
     pub gaussian_mode: GaussianMode,
     pub playback_mode: PlaybackMode,
@@ -86,6 +117,12 @@ pub struct CloudSettings {
     pub time_scale: f32,
     pub time_start: f32,
     pub time_stop: f32,
+    /// Additive/emissive blending. `false` (default) keeps premultiplied alpha-over, which is
+    /// byte-identical to previous behaviour. When `true` the cloud composites `One + One`, so
+    /// overlapping premultiplied fragments accumulate light and glow on a dark background instead
+    /// of alpha-saturating into a solid blob. Additive draws have no occlusion (everything shows
+    /// through), so it suits emissive/procedural content; leave it `false` for solid captures.
+    pub additive: bool,
     pub shape: SplatShape,
     pub edge_fuzziness: f32,
 }
@@ -99,6 +136,7 @@ impl Default for CloudSettings {
             opacity_adaptive_radius: false,
             visualize_bounding_box: false,
             sort_mode: SortMode::default(),
+            radix_sort_depth_bits: RadixSortDepthBits::default(),
             draw_mode: DrawMode::default(),
             gaussian_mode: GaussianMode::default(),
             rasterize_mode: RasterizeMode::default(),
@@ -111,6 +149,7 @@ impl Default for CloudSettings {
             time_stop: 1.0,
             shape: SplatShape::Circle,
             edge_fuzziness: 1.0,
+            additive: false,
         }
     }
 }
@@ -120,6 +159,7 @@ pub struct SettingsPlugin;
 impl Plugin for SettingsPlugin {
     fn build(&self, app: &mut App) {
         app.register_type::<CloudSettings>();
+        app.register_type::<RadixSortDepthBits>();
 
         app.add_systems(Update, (playback_update,));
     }

@@ -4,15 +4,12 @@ use std::collections::HashMap;
 
 use bevy::{
     asset::{load_internal_asset, uuid_handle},
-    core_pipeline::{
-        core_3d::graph::{Core3d, Node3d},
-        prepass::PreviousViewUniformOffset,
-    },
+    core_pipeline::{Core3d, Core3dSystems, prepass::PreviousViewUniformOffset},
     prelude::*,
     render::{
         Render, RenderApp, RenderSystems,
+        extract_component::DynamicUniformIndex,
         render_asset::RenderAssets,
-        render_graph::{Node, NodeRunError, RenderGraphContext, RenderGraphExt, RenderLabel},
         render_resource::{
             BindGroup, BindGroupEntry, BindGroupLayout, BindGroupLayoutDescriptor,
             BindGroupLayoutEntry, BindingResource, BindingType, Buffer, BufferBinding,
@@ -20,7 +17,7 @@ use bevy::{
             CachedComputePipelineId, CachedPipelineState, ComputePassDescriptor,
             ComputePipelineDescriptor, PipelineCache, ShaderStages,
         },
-        renderer::{RenderContext, RenderDevice},
+        renderer::{RenderContext, RenderDevice, ViewQuery},
         view::ViewUniformOffset,
     },
 };
@@ -31,9 +28,10 @@ use static_assertions::assert_cfg;
 use crate::{gaussian::formats::planar_3d::PlanarGaussian3d, morph::interpolate::InterpolateLabel};
 
 use crate::{
-    CloudSettings, GaussianCamera,
+    CloudSettings, GaussianCamera, RadixSortDepthBits,
     render::{
-        CloudPipeline, CloudPipelineKey, GaussianUniformBindGroups, ShaderDefines, shader_defs,
+        CloudPipeline, CloudPipelineKey, CloudUniform, GaussianUniformBindGroups, ShaderDefines,
+        shader_defs_with_defines,
     },
     sort::{GpuSortedEntry, SortEntry, SortMode, SortPluginFlag, SortedEntriesHandle},
 };
@@ -53,8 +51,9 @@ const RADIX_PIPELINE_C_COUNT: usize = 3;
 const RADIX_PIPELINE_C_SCAN: usize = 4;
 const RADIX_PIPELINE_C_SCATTER: usize = 5;
 const RADIX_PIPELINE_COUNT: usize = 6;
+const RADIX_DEPTH_BITS_VARIANT_COUNT: usize = 3;
 
-#[derive(Debug, Hash, PartialEq, Eq, Clone, RenderLabel)]
+#[derive(Debug, Hash, PartialEq, Eq, Clone, SystemSet)]
 pub struct RadixSortLabel;
 
 #[derive(Default)]
@@ -93,14 +92,31 @@ where
         );
 
         if let Some(render_app) = app.get_sub_app_mut(RenderApp) {
-            render_app.add_render_graph_node::<RadixSortNode<R>>(Core3d, RadixSortLabel);
-
             #[cfg(feature = "morph_interpolate")]
             if TypeId::of::<R::PlanarType>() == TypeId::of::<PlanarGaussian3d>() {
-                render_app.add_render_graph_edge(Core3d, InterpolateLabel, RadixSortLabel);
+                render_app.add_systems(
+                    Core3d,
+                    run_radix_sort::<R>
+                        .in_set(RadixSortLabel)
+                        .after(InterpolateLabel)
+                        .before(Core3dSystems::Prepass),
+                );
+            } else {
+                render_app.add_systems(
+                    Core3d,
+                    run_radix_sort::<R>
+                        .in_set(RadixSortLabel)
+                        .before(Core3dSystems::Prepass),
+                );
             }
 
-            render_app.add_render_graph_edge(Core3d, RadixSortLabel, Node3d::LatePrepass);
+            #[cfg(not(feature = "morph_interpolate"))]
+            render_app.add_systems(
+                Core3d,
+                run_radix_sort::<R>
+                    .in_set(RadixSortLabel)
+                    .before(Core3dSystems::Prepass),
+            );
         }
     }
 
@@ -196,8 +212,52 @@ fn update_sort_buffers<R: PlanarSync>(
 #[derive(Resource)]
 pub struct RadixSortPipeline<R: PlanarSync> {
     pub radix_sort_layout: BindGroupLayout,
-    pub radix_sort_pipelines: [CachedComputePipelineId; RADIX_PIPELINE_COUNT],
+    pub variants: [Option<RadixSortPipelineVariant>; RADIX_DEPTH_BITS_VARIANT_COUNT],
+    sorting_layout: Vec<BindGroupLayoutDescriptor>,
     phantom: std::marker::PhantomData<R>,
+}
+
+#[derive(Clone, Copy)]
+pub struct RadixSortPipelineVariant {
+    pub shader_defines: ShaderDefines,
+    pub radix_sort_pipelines: [CachedComputePipelineId; RADIX_PIPELINE_COUNT],
+}
+
+impl RadixSortPipelineVariant {
+    fn is_loaded(&self, pipeline_cache: &PipelineCache) -> bool {
+        self.radix_sort_pipelines.iter().all(|sort_pipeline| {
+            matches!(
+                pipeline_cache.get_compute_pipeline_state(*sort_pipeline),
+                CachedPipelineState::Ok(_)
+            )
+        })
+    }
+}
+
+impl<R: PlanarSync> RadixSortPipeline<R> {
+    fn variant(
+        &self,
+        radix_sort_depth_bits: RadixSortDepthBits,
+    ) -> Option<&RadixSortPipelineVariant> {
+        self.variants[radix_sort_depth_bits.pipeline_index()].as_ref()
+    }
+
+    fn queue_variant(
+        &mut self,
+        pipeline_cache: &PipelineCache,
+        radix_sort_depth_bits: RadixSortDepthBits,
+    ) {
+        let index = radix_sort_depth_bits.pipeline_index();
+        if self.variants[index].is_some() {
+            return;
+        }
+
+        self.variants[index] = Some(queue_radix_sort_pipeline_variant(
+            pipeline_cache,
+            self.sorting_layout.clone(),
+            radix_sort_depth_bits,
+        ));
+    }
 }
 
 impl<R: PlanarSync> FromWorld for RadixSortPipeline<R> {
@@ -290,82 +350,97 @@ impl<R: PlanarSync> FromWorld for RadixSortPipeline<R> {
             gaussian_cloud_pipeline.gaussian_cloud_layout_desc.clone(),
             radix_sort_layout_desc.clone(),
         ];
-        let shader_defs = shader_defs(CloudPipelineKey::default());
 
-        let pipeline_cache = render_world.resource::<PipelineCache>();
-        let radix_reset = pipeline_cache.queue_compute_pipeline(ComputePipelineDescriptor {
-            label: Some("radix_sort_reset".into()),
-            layout: sorting_layout.clone(),
-            push_constant_ranges: vec![],
-            shader: RADIX_SHADER_HANDLE,
-            shader_defs: shader_defs.clone(),
-            entry_point: Some("radix_reset".into()),
-            zero_initialize_workgroup_memory: true,
-        });
-
-        let radix_sort_a = pipeline_cache.queue_compute_pipeline(ComputePipelineDescriptor {
-            label: Some("radix_sort_a".into()),
-            layout: sorting_layout.clone(),
-            push_constant_ranges: vec![],
-            shader: RADIX_SHADER_HANDLE,
-            shader_defs: shader_defs.clone(),
-            entry_point: Some("radix_sort_a".into()),
-            zero_initialize_workgroup_memory: true,
-        });
-
-        let radix_sort_b = pipeline_cache.queue_compute_pipeline(ComputePipelineDescriptor {
-            label: Some("radix_sort_b".into()),
-            layout: sorting_layout.clone(),
-            push_constant_ranges: vec![],
-            shader: RADIX_SHADER_HANDLE,
-            shader_defs: shader_defs.clone(),
-            entry_point: Some("radix_sort_b".into()),
-            zero_initialize_workgroup_memory: true,
-        });
-
-        let radix_sort_c_count = pipeline_cache.queue_compute_pipeline(ComputePipelineDescriptor {
-            label: Some("radix_sort_c_count_tiles".into()),
-            layout: sorting_layout.clone(),
-            push_constant_ranges: vec![],
-            shader: RADIX_SHADER_HANDLE,
-            shader_defs: shader_defs.clone(),
-            entry_point: Some("radix_sort_c_count_tiles".into()),
-            zero_initialize_workgroup_memory: true,
-        });
-
-        let radix_sort_c_scan = pipeline_cache.queue_compute_pipeline(ComputePipelineDescriptor {
-            label: Some("radix_sort_c_scan_tiles".into()),
-            layout: sorting_layout.clone(),
-            push_constant_ranges: vec![],
-            shader: RADIX_SHADER_HANDLE,
-            shader_defs: shader_defs.clone(),
-            entry_point: Some("radix_sort_c_scan_tiles".into()),
-            zero_initialize_workgroup_memory: true,
-        });
-
-        let radix_sort_c_scatter =
-            pipeline_cache.queue_compute_pipeline(ComputePipelineDescriptor {
-                label: Some("radix_sort_c_scatter".into()),
-                layout: sorting_layout.clone(),
-                push_constant_ranges: vec![],
-                shader: RADIX_SHADER_HANDLE,
-                shader_defs: shader_defs.clone(),
-                entry_point: Some("radix_sort_c_scatter".into()),
-                zero_initialize_workgroup_memory: true,
-            });
+        let variants = [None; RADIX_DEPTH_BITS_VARIANT_COUNT];
 
         RadixSortPipeline {
             radix_sort_layout,
-            radix_sort_pipelines: [
-                radix_reset,
-                radix_sort_a,
-                radix_sort_b,
-                radix_sort_c_count,
-                radix_sort_c_scan,
-                radix_sort_c_scatter,
-            ],
+            variants,
+            sorting_layout,
             phantom: std::marker::PhantomData,
         }
+    }
+}
+
+fn queue_radix_sort_pipeline_variant(
+    pipeline_cache: &PipelineCache,
+    sorting_layout: Vec<BindGroupLayoutDescriptor>,
+    radix_sort_depth_bits: RadixSortDepthBits,
+) -> RadixSortPipelineVariant {
+    let shader_defines = ShaderDefines::for_radix_depth_bits(radix_sort_depth_bits);
+    let shader_defs = shader_defs_with_defines(CloudPipelineKey::default(), shader_defines);
+    let label_suffix = radix_sort_depth_bits.bits();
+
+    let radix_reset = pipeline_cache.queue_compute_pipeline(ComputePipelineDescriptor {
+        label: Some(format!("radix_sort_reset_{label_suffix}bit").into()),
+        layout: sorting_layout.clone(),
+        immediate_size: 0,
+        shader: RADIX_SHADER_HANDLE,
+        shader_defs: shader_defs.clone(),
+        entry_point: Some("radix_reset".into()),
+        zero_initialize_workgroup_memory: true,
+    });
+
+    let radix_sort_a = pipeline_cache.queue_compute_pipeline(ComputePipelineDescriptor {
+        label: Some(format!("radix_sort_a_{label_suffix}bit").into()),
+        layout: sorting_layout.clone(),
+        immediate_size: 0,
+        shader: RADIX_SHADER_HANDLE,
+        shader_defs: shader_defs.clone(),
+        entry_point: Some("radix_sort_a".into()),
+        zero_initialize_workgroup_memory: true,
+    });
+
+    let radix_sort_b = pipeline_cache.queue_compute_pipeline(ComputePipelineDescriptor {
+        label: Some(format!("radix_sort_b_{label_suffix}bit").into()),
+        layout: sorting_layout.clone(),
+        immediate_size: 0,
+        shader: RADIX_SHADER_HANDLE,
+        shader_defs: shader_defs.clone(),
+        entry_point: Some("radix_sort_b".into()),
+        zero_initialize_workgroup_memory: true,
+    });
+
+    let radix_sort_c_count = pipeline_cache.queue_compute_pipeline(ComputePipelineDescriptor {
+        label: Some(format!("radix_sort_c_count_tiles_{label_suffix}bit").into()),
+        layout: sorting_layout.clone(),
+        immediate_size: 0,
+        shader: RADIX_SHADER_HANDLE,
+        shader_defs: shader_defs.clone(),
+        entry_point: Some("radix_sort_c_count_tiles".into()),
+        zero_initialize_workgroup_memory: true,
+    });
+
+    let radix_sort_c_scan = pipeline_cache.queue_compute_pipeline(ComputePipelineDescriptor {
+        label: Some(format!("radix_sort_c_scan_tiles_{label_suffix}bit").into()),
+        layout: sorting_layout.clone(),
+        immediate_size: 0,
+        shader: RADIX_SHADER_HANDLE,
+        shader_defs: shader_defs.clone(),
+        entry_point: Some("radix_sort_c_scan_tiles".into()),
+        zero_initialize_workgroup_memory: true,
+    });
+
+    let radix_sort_c_scatter = pipeline_cache.queue_compute_pipeline(ComputePipelineDescriptor {
+        label: Some(format!("radix_sort_c_scatter_{label_suffix}bit").into()),
+        layout: sorting_layout,
+        immediate_size: 0,
+        shader: RADIX_SHADER_HANDLE,
+        shader_defs,
+        entry_point: Some("radix_sort_c_scatter".into()),
+        zero_initialize_workgroup_memory: true,
+    });
+
+    RadixSortPipelineVariant {
+        shader_defines,
+        radix_sort_pipelines: [
+            radix_reset,
+            radix_sort_a,
+            radix_sort_b,
+            radix_sort_c_count,
+            radix_sort_c_scan,
+            radix_sort_c_scatter,
+        ],
     }
 }
 
@@ -376,10 +451,18 @@ pub struct RadixBindGroup {
     pub radix_sort_bind_groups: [BindGroup; 8],
 }
 
+type RadixViewQueryItem = (
+    &'static GaussianCamera,
+    &'static crate::render::GaussianComputeViewBindGroup,
+    &'static ViewUniformOffset,
+    &'static PreviousViewUniformOffset,
+);
+
 #[allow(clippy::too_many_arguments)]
 pub fn queue_radix_bind_group<R: PlanarSync>(
     mut commands: Commands,
-    radix_pipeline: Res<RadixSortPipeline<R>>,
+    mut radix_pipeline: ResMut<RadixSortPipeline<R>>,
+    pipeline_cache: Res<PipelineCache>,
     render_device: Res<RenderDevice>,
     asset_server: Res<AssetServer>,
     gaussian_cloud_res: Res<RenderAssets<R::GpuPlanarType>>,
@@ -399,6 +482,8 @@ pub fn queue_radix_bind_group<R: PlanarSync>(
             commands.entity(entity).remove::<RadixBindGroup>();
             continue;
         }
+
+        radix_pipeline.queue_variant(&pipeline_cache, settings.radix_sort_depth_bits);
 
         // TODO: deduplicate asset load checks
         if let Some(load_state) = asset_server.get_load_state(cloud_handle.handle())
@@ -527,227 +612,145 @@ pub fn queue_radix_bind_group<R: PlanarSync>(
     }
 }
 
-pub struct RadixSortNode<R: PlanarSync> {
-    gaussian_clouds: QueryState<(
-        &'static R::PlanarTypeHandle,
+#[allow(clippy::too_many_arguments)]
+fn run_radix_sort<R: PlanarSync>(
+    mut render_context: RenderContext,
+    pipeline_cache: Res<PipelineCache>,
+    pipeline: Res<RadixSortPipeline<R>>,
+    gaussian_uniforms: Res<GaussianUniformBindGroups>,
+    sort_buffers: Res<RadixSortBuffers<R>>,
+    gpu_planars: Res<RenderAssets<R::GpuPlanarType>>,
+    view_bind_group: ViewQuery<RadixViewQueryItem>,
+    gaussian_clouds: Query<(
+        &'static <R as PlanarSync>::PlanarTypeHandle,
         &'static PlanarStorageBindGroup<R>,
         &'static RadixBindGroup,
+        &'static DynamicUniformIndex<CloudUniform>,
+        &'static CloudSettings,
     )>,
-    initialized: bool,
-    view_bind_group: QueryState<(
-        &'static GaussianCamera,
-        &'static crate::render::GaussianComputeViewBindGroup,
-        &'static ViewUniformOffset,
-        &'static PreviousViewUniformOffset,
-    )>,
-}
-
-impl<R: PlanarSync> FromWorld for RadixSortNode<R> {
-    fn from_world(world: &mut World) -> Self {
-        Self {
-            gaussian_clouds: world.query(),
-            initialized: false,
-            view_bind_group: world.query(),
-        }
-    }
-}
-
-impl<R: PlanarSync> Node for RadixSortNode<R>
-where
+) where
     R::GpuPlanarType: GpuPlanarStorage,
 {
-    fn update(&mut self, world: &mut World) {
-        let pipeline = world.resource::<RadixSortPipeline<R>>();
-        let pipeline_cache = world.resource::<PipelineCache>();
+    let (_camera, view_bind_group, view_uniform_offset, previous_view_uniform_offset) =
+        view_bind_group.into_inner();
 
-        if !self.initialized {
-            let mut pipelines_loaded = true;
-            for sort_pipeline in pipeline.radix_sort_pipelines.iter() {
-                if let CachedPipelineState::Ok(_) =
-                    pipeline_cache.get_compute_pipeline_state(*sort_pipeline)
-                {
-                    continue;
-                }
+    let Some(uniform_bind_group) = gaussian_uniforms.base_bind_group.as_ref() else {
+        debug!("RadixSort run skipped: GaussianUniform base bind group missing");
+        return;
+    };
 
-                pipelines_loaded = false;
-            }
+    for (cloud_handle, cloud_bind_group, radix_bind_group, cloud_uniform_index, cloud_settings) in
+        &gaussian_clouds
+    {
+        let Some(cloud) = gpu_planars.get(cloud_handle.handle()) else {
+            continue;
+        };
 
-            self.initialized = pipelines_loaded;
+        let Some(sorting_assets) = sort_buffers.asset_map.get(&cloud_handle.handle().id()) else {
+            continue;
+        };
 
-            if !self.initialized {
-                return;
-            }
+        let Some(pipeline_variant) = pipeline.variant(cloud_settings.radix_sort_depth_bits) else {
+            continue;
+        };
+        if !pipeline_variant.is_loaded(&pipeline_cache) {
+            continue;
         }
 
-        self.gaussian_clouds.update_archetypes(world);
-        self.view_bind_group.update_archetypes(world);
-    }
+        let command_encoder = render_context.command_encoder();
+        let shader_defines = pipeline_variant.shader_defines;
+        let radix_digit_places = shader_defines.radix_digit_places;
+        let initial_parity = shader_defines.radix_initial_parity();
+        let workgroup_entries_a = shader_defines.workgroup_entries_a;
+        let workgroup_entries_c = shader_defines.workgroup_entries_c;
+        let tile_workgroups = (cloud.len() as u32).div_ceil(workgroup_entries_c);
 
-    fn run(
-        &self,
-        _graph: &mut RenderGraphContext,
-        render_context: &mut RenderContext,
-        world: &World,
-    ) -> Result<(), NodeRunError> {
-        if !self.initialized {
-            return Ok(());
-        }
+        command_encoder.clear_buffer(&sorting_assets.sorting_global_buffer, 0, None);
+        command_encoder.clear_buffer(&sorting_assets.sorting_status_counter_buffer, 0, None);
+        command_encoder.clear_buffer(cloud.draw_indirect_buffer(), 0, None);
 
-        let pipeline_cache = world.resource::<PipelineCache>();
-        let pipeline = world.resource::<RadixSortPipeline<R>>();
-        let gaussian_uniforms = world.resource::<GaussianUniformBindGroups>();
-        let sort_buffers = world.resource::<RadixSortBuffers<R>>();
-
-        for (_camera, view_bind_group, view_uniform_offset, previous_view_uniform_offset) in
-            self.view_bind_group.iter_manual(world)
         {
-            for (cloud_handle, cloud_bind_group, radix_bind_group) in
-                self.gaussian_clouds.iter_manual(world)
-            {
-                let cloud = world
-                    .get_resource::<RenderAssets<R::GpuPlanarType>>()
-                    .unwrap()
-                    .get(cloud_handle.handle())
-                    .unwrap();
+            let mut pass = command_encoder.begin_compute_pass(&ComputePassDescriptor::default());
 
-                assert!(
-                    sort_buffers
-                        .asset_map
-                        .contains_key(&cloud_handle.handle().id())
-                );
-                let sorting_assets = &sort_buffers.asset_map[&cloud_handle.handle().id()];
+            // Reset per-frame counters/histograms
+            let radix_reset = pipeline_cache
+                .get_compute_pipeline(pipeline_variant.radix_sort_pipelines[RADIX_PIPELINE_RESET])
+                .unwrap();
+            pass.set_pipeline(radix_reset);
+            pass.set_bind_group(
+                0,
+                &view_bind_group.value,
+                &[
+                    view_uniform_offset.offset,
+                    previous_view_uniform_offset.offset,
+                ],
+            );
+            pass.set_bind_group(1, uniform_bind_group, &[cloud_uniform_index.index()]);
+            pass.set_bind_group(2, &cloud_bind_group.bind_group, &[]);
+            pass.set_bind_group(
+                3,
+                &radix_bind_group.radix_sort_bind_groups[initial_parity],
+                &[],
+            );
+            pass.dispatch_workgroups(1, 1, 1);
 
-                {
-                    let command_encoder = render_context.command_encoder();
-                    let shader_defines = ShaderDefines::default();
-                    let radix_digit_places = shader_defines.radix_digit_places;
-                    let radix_base = shader_defines.radix_base;
-                    let workgroup_entries_a = shader_defines.workgroup_entries_a;
-                    let workgroup_entries_c = shader_defines.workgroup_entries_c;
-                    let tile_workgroups = (cloud.len() as u32).div_ceil(workgroup_entries_c);
+            let radix_sort_a = pipeline_cache
+                .get_compute_pipeline(pipeline_variant.radix_sort_pipelines[RADIX_PIPELINE_A])
+                .unwrap();
+            pass.set_pipeline(radix_sort_a);
 
-                    {
-                        command_encoder.clear_buffer(
-                            &sorting_assets.sorting_global_buffer,
-                            0,
-                            None,
-                        );
+            pass.dispatch_workgroups((cloud.len() as u32).div_ceil(workgroup_entries_a), 1, 1);
 
-                        command_encoder.clear_buffer(
-                            &sorting_assets.sorting_status_counter_buffer,
-                            0,
-                            None,
-                        );
+            let radix_sort_b = pipeline_cache
+                .get_compute_pipeline(pipeline_variant.radix_sort_pipelines[RADIX_PIPELINE_B])
+                .unwrap();
+            pass.set_pipeline(radix_sort_b);
 
-                        command_encoder.clear_buffer(cloud.draw_indirect_buffer(), 0, None);
-                    }
-
-                    {
-                        let mut pass =
-                            command_encoder.begin_compute_pass(&ComputePassDescriptor::default());
-
-                        // Reset per-frame counters/histograms
-                        let radix_reset = pipeline_cache
-                            .get_compute_pipeline(
-                                pipeline.radix_sort_pipelines[RADIX_PIPELINE_RESET],
-                            )
-                            .unwrap();
-                        pass.set_pipeline(radix_reset);
-                        pass.set_bind_group(
-                            0,
-                            &view_bind_group.value,
-                            &[
-                                view_uniform_offset.offset,
-                                previous_view_uniform_offset.offset,
-                            ],
-                        );
-                        pass.set_bind_group(
-                            1,
-                            gaussian_uniforms.base_bind_group.as_ref().unwrap(),
-                            &[0],
-                        );
-                        pass.set_bind_group(2, &cloud_bind_group.bind_group, &[]);
-                        pass.set_bind_group(3, &radix_bind_group.radix_sort_bind_groups[0], &[]);
-                        pass.dispatch_workgroups(1, 1, 1);
-
-                        let radix_sort_a = pipeline_cache
-                            .get_compute_pipeline(pipeline.radix_sort_pipelines[RADIX_PIPELINE_A])
-                            .unwrap();
-                        pass.set_pipeline(radix_sort_a);
-
-                        pass.dispatch_workgroups(
-                            (cloud.len() as u32).div_ceil(workgroup_entries_a),
-                            1,
-                            1,
-                        );
-
-                        let radix_sort_b = pipeline_cache
-                            .get_compute_pipeline(pipeline.radix_sort_pipelines[RADIX_PIPELINE_B])
-                            .unwrap();
-                        pass.set_pipeline(radix_sort_b);
-
-                        pass.dispatch_workgroups(1, radix_digit_places, 1);
-                    }
-
-                    // TODO: add options to only complete a fraction of the sorting process
-                    for pass_idx in 0..radix_digit_places {
-                        let mut pass =
-                            command_encoder.begin_compute_pass(&ComputePassDescriptor::default());
-
-                        // Set common bind groups for view/uniforms and cloud storage
-                        pass.set_bind_group(
-                            0,
-                            &view_bind_group.value,
-                            &[
-                                view_uniform_offset.offset,
-                                previous_view_uniform_offset.offset,
-                            ],
-                        );
-                        pass.set_bind_group(
-                            1,
-                            gaussian_uniforms.base_bind_group.as_ref().unwrap(),
-                            &[0],
-                        );
-                        pass.set_bind_group(2, &cloud_bind_group.bind_group, &[]);
-
-                        // For pass C, choose bind group based on digit place and parity
-                        // THIS IS THE FIX:
-                        let parity = (pass_idx % 2) as usize;
-                        let bg_index = (pass_idx as usize) * 2 + parity;
-                        pass.set_bind_group(
-                            3,
-                            &radix_bind_group.radix_sort_bind_groups[bg_index],
-                            &[],
-                        );
-
-                        let radix_sort_c_count = pipeline_cache
-                            .get_compute_pipeline(
-                                pipeline.radix_sort_pipelines[RADIX_PIPELINE_C_COUNT],
-                            )
-                            .unwrap();
-                        pass.set_pipeline(radix_sort_c_count);
-                        pass.dispatch_workgroups(1, tile_workgroups, 1);
-
-                        let radix_sort_c_scan = pipeline_cache
-                            .get_compute_pipeline(
-                                pipeline.radix_sort_pipelines[RADIX_PIPELINE_C_SCAN],
-                            )
-                            .unwrap();
-                        pass.set_pipeline(radix_sort_c_scan);
-                        pass.dispatch_workgroups(1, radix_base, 1);
-
-                        let radix_sort_c_scatter = pipeline_cache
-                            .get_compute_pipeline(
-                                pipeline.radix_sort_pipelines[RADIX_PIPELINE_C_SCATTER],
-                            )
-                            .unwrap();
-                        pass.set_pipeline(radix_sort_c_scatter);
-                        pass.dispatch_workgroups(1, tile_workgroups, 1);
-                    }
-                }
-            }
+            pass.dispatch_workgroups(1, radix_digit_places, 1);
         }
 
-        Ok(())
+        // TODO: add options to only complete a fraction of the sorting process
+        for pass_idx in 0..radix_digit_places {
+            let mut pass = command_encoder.begin_compute_pass(&ComputePassDescriptor::default());
+
+            // Set common bind groups for view/uniforms and cloud storage
+            pass.set_bind_group(
+                0,
+                &view_bind_group.value,
+                &[
+                    view_uniform_offset.offset,
+                    previous_view_uniform_offset.offset,
+                ],
+            );
+            pass.set_bind_group(1, uniform_bind_group, &[cloud_uniform_index.index()]);
+            pass.set_bind_group(2, &cloud_bind_group.bind_group, &[]);
+
+            // Choose the initial parity so the final pass writes to sorted_entries.
+            let parity = ((pass_idx as usize) + initial_parity) % 2;
+            let bg_index = (pass_idx as usize) * 2 + parity;
+            pass.set_bind_group(3, &radix_bind_group.radix_sort_bind_groups[bg_index], &[]);
+
+            let radix_sort_c_count = pipeline_cache
+                .get_compute_pipeline(pipeline_variant.radix_sort_pipelines[RADIX_PIPELINE_C_COUNT])
+                .unwrap();
+            pass.set_pipeline(radix_sort_c_count);
+            pass.dispatch_workgroups(1, tile_workgroups, 1);
+
+            let radix_sort_c_scan = pipeline_cache
+                .get_compute_pipeline(pipeline_variant.radix_sort_pipelines[RADIX_PIPELINE_C_SCAN])
+                .unwrap();
+            pass.set_pipeline(radix_sort_c_scan);
+            // ONE workgroup of RADIX_BASE lanes (lane = digit), not RADIX_BASE single-lane
+            // workgroups -- see `radix_sort_c_scan_tiles`'s @workgroup_size in radix.wgsl.
+            pass.dispatch_workgroups(1, 1, 1);
+
+            let radix_sort_c_scatter = pipeline_cache
+                .get_compute_pipeline(
+                    pipeline_variant.radix_sort_pipelines[RADIX_PIPELINE_C_SCATTER],
+                )
+                .unwrap();
+            pass.set_pipeline(radix_sort_c_scatter);
+            pass.dispatch_workgroups(1, tile_workgroups, 1);
+        }
     }
 }
